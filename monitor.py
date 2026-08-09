@@ -11,6 +11,7 @@ ACCOUNTS = [
     "AZINABUER",
     "byst1522",
     "wqinginovo",
+    "luchu888",
 ]
 
 STATE_FILE = "seen.json"
