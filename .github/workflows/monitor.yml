@@ -47,5 +47,6 @@ jobs:
             echo "No state changes."
           else
             git commit -m "Update monitor state"
+            git pull --rebase origin main
             git push
           fi
