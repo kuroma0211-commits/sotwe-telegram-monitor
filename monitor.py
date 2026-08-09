@@ -9,13 +9,14 @@ from playwright.sync_api import sync_playwright
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+# 換成你要監控的一般帳號 (例如新聞媒體、公開資訊帳號)
 ACCOUNTS = [
-    "AZINABUER",
-    "byst1522",
-    "wqinginovo",
+    "nasa",
+    "cnn",
 ]
 
 STATE_FILE = "seen.json"
+
 
 def load_seen():
     if not os.path.exists(STATE_FILE):
@@ -26,9 +27,11 @@ def load_seen():
     except Exception:
         return {}
 
+
 def save_seen(seen):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
+
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -43,75 +46,70 @@ def send_telegram(text):
     )
     response.raise_for_status()
 
-def get_tweet_url(card):
-    for a in card.find_all("a", href=True):
-        href = a["href"]
-        if "/status/" in href:
-            if href.startswith("/"):
-                return "https://x.com" + href
-            if href.startswith("http"):
-                return href
-    return None
 
-def get_media_urls(card):
-    urls = []
-    for video in card.find_all("video"):
-        src = video.get("src")
-        if src:
-            urls.append(src)
-        for source in video.find_all("source"):
-            src = source.get("src")
-            if src:
-                urls.append(src)
-    for img in card.find_all("img"):
-        src = img.get("src")
-        if src:
-            urls.append(src)
-    return sorted(set(urls))
-
-def make_video_id(account, card):
-    media_urls = get_media_urls(card)
-    text = card.get_text(" ", strip=True)
-    if media_urls:
-        raw = account.lower() + "|" + "|".join(media_urls)
-    else:
-        raw = account.lower() + "|" + text
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-def fetch_account_with_playwright(page, account):
+def fetch_account_with_playwright(page, account, debug=False):
     url = f"https://www.sotwe.com/{account}?lang=en"
     print(f"Checking @{account} via Playwright...")
-    
+
     page.goto(url, wait_until="networkidle", timeout=60000)
-    time.sleep(3)  # 等待 DOM 完全渲染
-    
+    time.sleep(3)
+
     html = page.content()
+
+    if debug:
+        # 除錯用: 把實際抓到的 HTML 存下來檢查真正的 class 結構
+        with open(f"debug_{account}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+
     soup = BeautifulSoup(html, "html.parser")
-    
-    cards = soup.select(".tweet-card")
-    if not cards:
-        cards = soup.find_all("div", class_=lambda c: c and "tweet" in c.lower())
 
-    print(f"  Found {len(cards)} tweet cards")
+    # 改用更穩健的方式: 找所有含 /status/ 連結的 <a>,
+    # 往上找到該推文的容器區塊(通常是它的祖先 article 或 div)
+    status_links = soup.find_all("a", href=lambda h: h and "/status/" in h)
 
+    seen_urls = set()
     videos = []
-    for card in cards:
-        text = card.get_text(" ", strip=True)
-        if "retweeted" in text.lower():
+    for link in status_links:
+        href = link["href"]
+        tweet_url = "https://x.com" + href if href.startswith("/") else href
+        if tweet_url in seen_urls:
             continue
-        
-        # 只要包含媒體或推文連結就納入紀錄
-        video_id = make_video_id(account, card)
-        tweet_url = get_tweet_url(card)
-        
+        seen_urls.add(tweet_url)
+
+        # 往上找一個看起來像卡片容器的父層(有多個子元素、包含文字)
+        container = link
+        for _ in range(6):
+            if container.parent is None:
+                break
+            container = container.parent
+            if len(container.get_text(strip=True)) > 20:
+                break
+
+        text = container.get_text(" ", strip=True)
+        media_urls = []
+        for video in container.find_all("video"):
+            if video.get("src"):
+                media_urls.append(video["src"])
+            for source in video.find_all("source"):
+                if source.get("src"):
+                    media_urls.append(source["src"])
+        for img in container.find_all("img"):
+            if img.get("src"):
+                media_urls.append(img["src"])
+
+        raw = account.lower() + "|" + tweet_url
+        video_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
         videos.append({
             "id": video_id,
             "account": account,
             "url": tweet_url,
-            "text": text,
+            "text": text[:200],
         })
 
+    print(f"  Found {len(videos)} tweet items")
     return videos
+
 
 def main():
     seen = load_seen()
@@ -120,7 +118,7 @@ def main():
     if first_run:
         print("First run - building baseline.")
     else:
-        print("Checking for new videos...")
+        print("Checking for new items...")
 
     new_videos = []
 
@@ -132,7 +130,8 @@ def main():
 
         for account in ACCOUNTS:
             try:
-                videos = fetch_account_with_playwright(page, account)
+                # 第一次先開 debug=True 存 HTML 檢查結構,確認後可關掉
+                videos = fetch_account_with_playwright(page, account, debug=True)
                 if account not in seen:
                     seen[account] = []
 
@@ -157,7 +156,7 @@ def main():
         message = (
             "🤖 Sotwe Monitor 初始化完成！\n\n"
             f"目前已記錄 {total} 個項目。\n\n"
-            "之後只會通知新影片/貼文。"
+            "之後只會通知新項目。"
         )
         send_telegram(message)
         print(message)
@@ -166,10 +165,9 @@ def main():
     if new_videos:
         for video in new_videos:
             account = video["account"]
-            tweet_url = video["url"]
-            link = tweet_url if tweet_url else f"https://x.com/{account}"
+            link = video["url"] or f"https://x.com/{account}"
             message = (
-                "🎬 發現新影片/貼文！\n\n"
+                "🎬 發現新貼文！\n\n"
                 f"帳號：@{account}\n\n"
                 f"🔗 {link}"
             )
@@ -177,6 +175,7 @@ def main():
             print(f"NEW ITEM @{account}: {link}")
     else:
         print("No new items.")
+
 
 if __name__ == "__main__":
     main()
