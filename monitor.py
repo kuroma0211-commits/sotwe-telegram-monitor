@@ -1,8 +1,10 @@
 import os
 import json
 import hashlib
+import time
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -11,18 +13,9 @@ ACCOUNTS = [
     "AZINABUER",
     "byst1522",
     "wqinginovo",
-    "luchu888",
 ]
 
 STATE_FILE = "seen.json"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/150.0.0.0 Safari/537.36"
-    )
-}
 
 def load_seen():
     if not os.path.exists(STATE_FILE):
@@ -85,43 +78,44 @@ def make_video_id(account, card):
         raw = account.lower() + "|" + text
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-def is_own_video(card, account):
-    text = card.get_text(" ", strip=True)
-    if "retweeted" in text.lower():
-        return False
-    account_lower = account.lower()
-    if f"{account_lower}'s tweet video." in text.lower():
-        return True
-    if "tweet video." in text.lower():
-        return account_lower in text.lower()
-    return False
-
-def fetch_account(account):
+def fetch_account_with_playwright(page, account):
     url = f"https://www.sotwe.com/{account}?lang=en"
-    print(f"Checking @{account} ...")
-    response = requests.get(url, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    print(f"Checking @{account} via Playwright...")
+    
+    page.goto(url, wait_until="networkidle", timeout=60000)
+    time.sleep(3)  # 等待 DOM 完全渲染
+    
+    html = page.content()
+    soup = BeautifulSoup(html, "html.parser")
+    
     cards = soup.select(".tweet-card")
+    if not cards:
+        cards = soup.find_all("div", class_=lambda c: c and "tweet" in c.lower())
+
     print(f"  Found {len(cards)} tweet cards")
+
     videos = []
     for card in cards:
-        if not is_own_video(card, account):
+        text = card.get_text(" ", strip=True)
+        if "retweeted" in text.lower():
             continue
+        
+        # 只要包含媒體或推文連結就納入紀錄
         video_id = make_video_id(account, card)
         tweet_url = get_tweet_url(card)
-        text = card.get_text(" ", strip=True)
+        
         videos.append({
             "id": video_id,
             "account": account,
             "url": tweet_url,
             "text": text,
         })
+
     return videos
 
 def main():
     seen = load_seen()
-    first_run = not bool(seen)
+    first_run = not bool(seen) or all(len(v) == 0 for v in seen.values())
 
     if first_run:
         print("First run - building baseline.")
@@ -130,19 +124,28 @@ def main():
 
     new_videos = []
 
-    for account in ACCOUNTS:
-        try:
-            videos = fetch_account(account)
-            if account not in seen:
-                seen[account] = []
-            for video in videos:
-                video_id = video["id"]
-                if video_id not in seen[account]:
-                    seen[account].append(video_id)
-                    if not first_run:
-                        new_videos.append(video)
-        except Exception as e:
-            print(f"ERROR @{account}: {e}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        for account in ACCOUNTS:
+            try:
+                videos = fetch_account_with_playwright(page, account)
+                if account not in seen:
+                    seen[account] = []
+
+                for video in videos:
+                    video_id = video["id"]
+                    if video_id not in seen[account]:
+                        seen[account].append(video_id)
+                        if not first_run:
+                            new_videos.append(video)
+            except Exception as e:
+                print(f"ERROR @{account}: {e}")
+
+        browser.close()
 
     for account in seen:
         seen[account] = seen[account][-200:]
@@ -153,8 +156,8 @@ def main():
         total = sum(len(v) for v in seen.values())
         message = (
             "🤖 Sotwe Monitor 初始化完成！\n\n"
-            f"目前已記錄 {total} 個影片。\n\n"
-            "之後只會通知新的影片。"
+            f"目前已記錄 {total} 個項目。\n\n"
+            "之後只會通知新影片/貼文。"
         )
         send_telegram(message)
         print(message)
@@ -166,14 +169,14 @@ def main():
             tweet_url = video["url"]
             link = tweet_url if tweet_url else f"https://x.com/{account}"
             message = (
-                "🎬 發現新影片！\n\n"
+                "🎬 發現新影片/貼文！\n\n"
                 f"帳號：@{account}\n\n"
                 f"🔗 {link}"
             )
             send_telegram(message)
-            print(f"NEW VIDEO @{account}: {link}")
+            print(f"NEW ITEM @{account}: {link}")
     else:
-        print("No new videos.")
+        print("No new items.")
 
 if __name__ == "__main__":
     main()
